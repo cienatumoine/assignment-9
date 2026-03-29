@@ -1,6 +1,6 @@
 const express = require('express');
-const session = require('express-session');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const { db, User, Project, Task } = require('./database/setup');
 require('dotenv').config();
 
@@ -10,34 +10,72 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(express.json());
 
-// Session middleware (TODO: Replace with JWT)
-app.use(session({
-    secret: process.env.SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: { 
-        secure: false,
-        maxAge: 24 * 60 * 60 * 1000 // 24 hours
-    }
-}));
+// ========================
+// JWT AUTH MIDDLEWARE
+// ========================
 
-// TODO: Create JWT middleware to replace session auth
+// Authenticate any logged-in user via JWT
 function requireAuth(req, res, next) {
-    if (req.session && req.session.userId) {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'No token provided' });
+    }
+
+    const token = authHeader.substring(7); // remove "Bearer "
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
         req.user = {
-            id: req.session.userId,
-            name: req.session.userName,
-            email: req.session.userEmail
+            id: decoded.id,
+            name: decoded.name,
+            email: decoded.email,
+            role: decoded.role
         };
+
         next();
-    } else {
-        res.status(401).json({ 
-            error: 'Authentication required. Please log in.' 
-        });
+    } catch (error) {
+        console.error('JWT verification error:', error);
+
+        if (error.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: 'Token expired' });
+        }
+
+        return res.status(401).json({ error: 'Invalid token' });
     }
 }
 
-// Test database connection
+// Managers OR admins
+function requireManager(req, res, next) {
+    if (!req.user) {
+        return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    if (req.user.role === 'manager' || req.user.role === 'admin') {
+        return next();
+    }
+
+    return res.status(403).json({ error: 'Manager or admin role required' });
+}
+
+// Admin only
+function requireAdmin(req, res, next) {
+    if (!req.user) {
+        return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    if (req.user.role === 'admin') {
+        return next();
+    }
+
+    return res.status(403).json({ error: 'Admin role required' });
+}
+
+// ========================
+// TEST DB CONNECTION
+// ========================
+
 async function testConnection() {
     try {
         await db.authenticate();
@@ -49,12 +87,14 @@ async function testConnection() {
 
 testConnection();
 
+// ========================
 // AUTHENTICATION ROUTES
+// ========================
 
 // POST /api/register - Register new user
 app.post('/api/register', async (req, res) => {
     try {
-        const { name, email, password } = req.body;
+        const { name, email, password, role } = req.body;
         
         // Check if user exists
         const existingUser = await User.findOne({ where: { email } });
@@ -65,20 +105,34 @@ app.post('/api/register', async (req, res) => {
         // Hash password
         const hashedPassword = await bcrypt.hash(password, 10);
         
-        // Create user
+        // Create user (role defaults to 'employee' in model if not provided)
         const newUser = await User.create({
             name,
             email,
-            password: hashedPassword
-            // TODO: Add role field
+            password: hashedPassword,
+            role: role || 'employee'
         });
+
+        // Create JWT for new user
+        const token = jwt.sign(
+            {
+                id: newUser.id,
+                name: newUser.name,
+                email: newUser.email,
+                role: newUser.role
+            },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRES_IN }
+        );
         
         res.status(201).json({
             message: 'User registered successfully',
+            token,
             user: {
                 id: newUser.id,
                 name: newUser.name,
-                email: newUser.email
+                email: newUser.email,
+                role: newUser.role
             }
         });
         
@@ -88,7 +142,7 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// POST /api/login - User login (TODO: Replace with JWT)
+// POST /api/login - User login (JWT)
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -103,17 +157,26 @@ app.post('/api/login', async (req, res) => {
             return res.status(401).json({ error: 'Invalid email or password' });
         }
         
-        // Create session (TODO: Replace with JWT)
-        req.session.userId = user.id;
-        req.session.userName = user.name;
-        req.session.userEmail = user.email;
+        // Create JWT
+        const token = jwt.sign(
+            {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role
+            },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRES_IN }
+        );
         
         res.json({
             message: 'Login successful',
+            token,
             user: {
                 id: user.id,
                 name: user.name,
-                email: user.email
+                email: user.email,
+                role: user.role
             }
         });
         
@@ -123,23 +186,21 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// POST /api/logout - User logout
+// POST /api/logout - User logout (stateless)
 app.post('/api/logout', (req, res) => {
-    req.session.destroy((err) => {
-        if (err) {
-            return res.status(500).json({ error: 'Failed to logout' });
-        }
-        res.json({ message: 'Logout successful' });
-    });
+    // With JWT, logout is handled client-side by discarding the token
+    res.json({ message: 'Logout successful. Please discard your token on the client.' });
 });
 
+// ========================
 // USER ROUTES
+// ========================
 
 // GET /api/users/profile - Get current user profile
 app.get('/api/users/profile', requireAuth, async (req, res) => {
     try {
         const user = await User.findByPk(req.user.id, {
-            attributes: ['id', 'name', 'email'] // Don't return password
+            attributes: ['id', 'name', 'email', 'role'] // Don't return password
         });
         
         if (!user) {
@@ -153,11 +214,11 @@ app.get('/api/users/profile', requireAuth, async (req, res) => {
     }
 });
 
-// GET /api/users - Get all users (TODO: Admin only)
-app.get('/api/users', requireAuth, async (req, res) => {
+// GET /api/users - Get all users (Admin only)
+app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
     try {
         const users = await User.findAll({
-            attributes: ['id', 'name', 'email'] // Don't return passwords
+            attributes: ['id', 'name', 'email', 'role'] // Don't return passwords
         });
         
         res.json(users);
@@ -167,7 +228,9 @@ app.get('/api/users', requireAuth, async (req, res) => {
     }
 });
 
+// ========================
 // PROJECT ROUTES
+// ========================
 
 // GET /api/projects - Get projects
 app.get('/api/projects', requireAuth, async (req, res) => {
@@ -223,8 +286,8 @@ app.get('/api/projects/:id', requireAuth, async (req, res) => {
     }
 });
 
-// POST /api/projects - Create new project (TODO: Manager+ only)
-app.post('/api/projects', requireAuth, async (req, res) => {
+// POST /api/projects - Create new project (Manager+ only)
+app.post('/api/projects', requireAuth, requireManager, async (req, res) => {
     try {
         const { name, description, status = 'active' } = req.body;
         
@@ -242,8 +305,8 @@ app.post('/api/projects', requireAuth, async (req, res) => {
     }
 });
 
-// PUT /api/projects/:id - Update project (TODO: Manager+ only)
-app.put('/api/projects/:id', requireAuth, async (req, res) => {
+// PUT /api/projects/:id - Update project (Manager+ only)
+app.put('/api/projects/:id', requireAuth, requireManager, async (req, res) => {
     try {
         const { name, description, status } = req.body;
         
@@ -264,8 +327,8 @@ app.put('/api/projects/:id', requireAuth, async (req, res) => {
     }
 });
 
-// DELETE /api/projects/:id - Delete project (TODO: Admin only)
-app.delete('/api/projects/:id', requireAuth, async (req, res) => {
+// DELETE /api/projects/:id - Delete project (Admin only)
+app.delete('/api/projects/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
         const deletedRowsCount = await Project.destroy({
             where: { id: req.params.id }
@@ -282,7 +345,9 @@ app.delete('/api/projects/:id', requireAuth, async (req, res) => {
     }
 });
 
+// ========================
 // TASK ROUTES
+// ========================
 
 // GET /api/projects/:id/tasks - Get tasks for a project
 app.get('/api/projects/:id/tasks', requireAuth, async (req, res) => {
@@ -305,8 +370,8 @@ app.get('/api/projects/:id/tasks', requireAuth, async (req, res) => {
     }
 });
 
-// POST /api/projects/:id/tasks - Create task (TODO: Manager+ only)
-app.post('/api/projects/:id/tasks', requireAuth, async (req, res) => {
+// POST /api/projects/:id/tasks - Create task (Manager+ only)
+app.post('/api/projects/:id/tasks', requireAuth, requireManager, async (req, res) => {
     try {
         const { title, description, assignedUserId, priority = 'medium' } = req.body;
         
@@ -326,7 +391,7 @@ app.post('/api/projects/:id/tasks', requireAuth, async (req, res) => {
     }
 });
 
-// PUT /api/tasks/:id - Update task
+// PUT /api/tasks/:id - Update task (employee can update own task; manager+ can update all if you want to extend later)
 app.put('/api/tasks/:id', requireAuth, async (req, res) => {
     try {
         const { title, description, status, priority } = req.body;
@@ -348,8 +413,8 @@ app.put('/api/tasks/:id', requireAuth, async (req, res) => {
     }
 });
 
-// DELETE /api/tasks/:id - Delete task (TODO: Manager+ only)
-app.delete('/api/tasks/:id', requireAuth, async (req, res) => {
+// DELETE /api/tasks/:id - Delete task (Manager+ only)
+app.delete('/api/tasks/:id', requireAuth, requireManager, async (req, res) => {
     try {
         const deletedRowsCount = await Task.destroy({
             where: { id: req.params.id }
@@ -366,7 +431,10 @@ app.delete('/api/tasks/:id', requireAuth, async (req, res) => {
     }
 });
 
-// Start server
+// ========================
+// START SERVER
+// ========================
+
 app.listen(PORT, () => {
-    console.log(`Server running on port http://localhost:${PORT}`);
-});
+    console.log(`Server running on http://localhost:${PORT}`);
+}); 
